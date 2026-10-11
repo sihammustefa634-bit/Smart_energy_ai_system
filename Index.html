@@ -1,0 +1,413 @@
+
+energy-app/
+├── server.py              # FastAPI backend (ML models & APIs)
+├── requirements.txt       # Python dependencies
+├── energy_data.csv        # Your dataset file
+└── static/
+    ├── index.html         # Frontend structure
+    ├── style.css          # Modern dark/light styling
+    └── app.js             # API requests & dynamic ch
+
+import os
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from xgboost import XGBRegressor
+
+app = FastAPI(title="Smart Energy AI API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+CSV_FILE = "energy_data.csv"
+
+# Global state
+model_state = {}
+
+
+def train_models():
+    if not os.path.exists(CSV_FILE):
+        return False
+
+    df = pd.read_csv(CSV_FILE)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["day_of_week"] = df["Date"].dt.dayofweek
+    df["month"] = df["Date"].dt.month
+    df["Has_AC"] = df["Has_AC"].map({"Yes": 1, "No": 0})
+    df = df.dropna()
+
+    df = df.sort_values(["Household_ID", "Date"])
+    df["future_demand"] = df.groupby("Household_ID")[
+        "Energy_Consumption_kWh"
+    ].shift(-1)
+    df = df.dropna(subset=["future_demand"])
+
+    features = [
+        "month",
+        "day_of_week",
+        "Avg_Temperature_C",
+        "Peak_Hours_Usage_kWh",
+        "Has_AC",
+    ]
+
+    X = df[features]
+    y = df["future_demand"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42
+    )
+
+    # XGBoost
+    xgb = XGBRegressor(
+        n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42
+    )
+    xgb.fit(X_train, y_train)
+    predictions = xgb.predict(X_test)
+
+    # Metrics
+    mae = float(mean_absolute_error(y_test, predictions))
+    rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))
+    r2 = float(r2_score(y_test, predictions))
+
+    # Anomaly
+    iso = IsolationForest(contamination=0.05, random_state=42)
+    iso.fit(X_train)
+    anomaly_preds = iso.predict(X_test)
+
+    results = pd.DataFrame(
+        {
+            "Actual": y_test.values,
+            "Predicted": predictions,
+            "Anomaly": np.where(anomaly_preds == -1, "Anomaly", "Normal"),
+        }
+    )
+
+    avg_demand = float(predictions.mean())
+    threshold = avg_demand * 1.20
+    results["Waste"] = np.where(
+        results["Predicted"] > threshold, "Possible Waste", "Normal"
+    )
+
+    q25 = float(np.percentile(predictions, 25))
+    q50 = float(np.percentile(predictions, 50))
+    q75 = float(np.percentile(predictions, 75))
+
+    def classify_usage(val):
+        if val <= q25:
+            return "Low"
+        elif val <= q50:
+            return "Normal"
+        elif val <= q75:
+            return "High"
+        return "Critical"
+
+    results["Usage_Level"] = results["Predicted"].apply(classify_usage)
+
+    def recommend(row):
+        if row["Usage_Level"] == "Critical":
+            return "Reduce energy usage immediately and avoid unnecessary appliances."
+        elif row["Usage_Level"] == "High":
+            return "Reduce energy usage during peak hours."
+        elif row["Anomaly"] == "Anomaly":
+            return "Unusual energy usage detected. Check appliances and recent usage patterns."
+        elif row["Waste"] == "Possible Waste":
+            return "Review high-energy appliances and reduce unnecessary usage."
+        return "Energy usage is within the normal range."
+
+    results["Recommendation"] = results.apply(recommend, axis=1)
+
+    chart_df = df.sort_values("Date").head(100)
+
+    model_state["xgb"] = xgb
+    model_state["features"] = features
+    model_state["threshold"] = threshold
+    model_state["q25"] = q25
+    model_state["q50"] = q50
+    model_state["q75"] = q75
+    model_state["metrics"] = {
+        "avg_energy": round(float(df["Energy_Consumption_kWh"].mean()), 2),
+        "max_energy": round(float(df["Energy_Consumption_kWh"].max()), 2),
+        "mae": round(mae, 3),
+        "rmse": round(rmse, 3),
+        "r2": round(r2, 3),
+        "anomaly_count": int((results["Anomaly"] == "Anomaly").sum()),
+    }
+    model_state["history"] = {
+        "dates": chart_df["Date"].dt.strftime("%Y-%m-%d").tolist(),
+        "energy": [round(float(v), 2) for v in chart_df["Energy_Consumption_kWh"].tolist()],
+    }
+    model_state["actual_vs_predicted"] = {
+        "actual": [round(float(v), 2) for v in y_test.values[:80]],
+        "predicted": [round(float(v), 2) for v in predictions[:80]],
+    }
+    model_state["usage_distribution"] = (
+        results["Usage_Level"].value_counts().to_dict()
+    )
+    model_state["anomaly_distribution"] = (
+        results["Anomaly"].value_counts().to_dict()
+    )
+    model_state["waste_distribution"] = (
+        results["Waste"].value_counts().to_dict()
+    )
+    model_state["table"] = results.head(15).round(2).to_dict(orient="records")
+    return True
+
+
+train_models()
+
+
+class PredictRequest(BaseModel):
+    month: int
+    day_of_week: int
+    Avg_Temperature_C: float
+    Peak_Hours_Usage_kWh: float
+    Has_AC: int
+
+
+@app.get("/api/dashboard")
+def get_dashboard():
+    if not model_state:
+        ok = train_models()
+        if not ok:
+            raise HTTPException(
+                status_code=404,
+                detail="energy_data.csv not found on backend server.",
+            )
+    return {
+        "metrics": model_state["metrics"],
+        "history": model_state["history"],
+        "actual_vs_predicted": model_state["actual_vs_predicted"],
+        "usage_distribution": model_state["usage_distribution"],
+        "anomaly_distribution": model_state["anomaly_distribution"],
+        "waste_distribution": model_state["waste_distribution"],
+        "table": model_state["table"],
+    }
+
+
+@app.post("/api/predict")
+def predict(req: PredictRequest):
+    if not model_state:
+        train_models()
+
+    features_input = pd.DataFrame([req.model_dump()])[model_state["features"]]
+    prediction = float(model_state["xgb"].predict(features_input)[0])
+
+    q25 = model_state["q25"]
+    q50 = model_state["q50"]
+    q75 = model_state["q75"]
+    threshold = model_state["threshold"]
+
+    if prediction <= q25:
+        usage_level = "Low"
+    elif prediction <= q50:
+        usage_level = "Normal"
+    elif prediction <= q75:
+        usage_level = "High"
+    else:
+        usage_level = "Critical"
+
+    waste_status = "Possible Waste" if prediction > threshold else "Normal"
+
+    if usage_level == "Critical":
+        rec = "Reduce energy usage immediately and avoid unnecessary appliances."
+    elif usage_level == "High":
+        rec = "Reduce energy usage during peak hours."
+    elif prediction > threshold:
+        rec = "Review high-energy appliances and reduce unnecessary usage."
+    else:
+        rec = "Energy usage is within the normal range."
+
+    return {
+        "prediction": round(prediction, 2),
+        "usage_level": usage_level,
+        "waste_status": waste_status,
+        "recommendation": rec,
+    }
+
+
+# Serve HTML static files
+os.makedirs("static", exist_ok=True)
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
+3.  static/index.html  (Frontend Structure)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Energy AI System</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <h2>⚡ Energy Prediction</h2>
+      <p class="subtitle">Enter parameters to forecast future demand</p>
+
+      <form id="predict-form">
+        <label for="month">Month (<span id="month-val">6</span>)</label>
+        <input type="range" id="month" min="1" max="12" value="6" />
+
+        <label for="day">Day of Week (<span id="day-val">2</span>)</label>
+        <input type="range" id="day" min="0" max="6" value="2" />
+
+        <label for="temp">Avg Temperature (°C)</label>
+        <input type="number" id="temp" step="0.1" value="20.0" required />
+
+        <label for="peak">Peak Hours Usage (kWh)</label>
+        <input type="number" id="peak" step="0.1" value="5.0" required />
+
+        <label for="ac">Air Conditioner</label>
+        <select id="ac">
+          <option value="1">Yes</option>
+          <option value="0">No</option>
+        </select>
+
+        <button type="submit" id="predict-btn">PREDICT ENERGY</button>
+      </form>
+
+      <!-- Live Prediction Result Box -->
+      <div id="prediction-result" class="card result-card hidden">
+        <h3>AI Prediction</h3>
+        <p><strong>Predicted:</strong> <span id="res-pred">-</span> kWh</p>
+        <p><strong>Usage Level:</strong> <span id="res-level" class="badge">-</span></p>
+        <p><strong>Waste Status:</strong> <span id="res-waste" class="badge">-</span></p>
+        <div id="res-rec" class="recommendation-box"></div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="content">
+      <header>
+        <h1>⚡ Smart Energy AI System</h1>
+        <p>AI-powered energy forecasting, anomaly detection, waste detection & smart recommendations.</p>
+      </header>
+
+      <!-- Stat Cards -->
+      <section class="stats-grid">
+        <div class="card stat">
+          <h4>Average Energy</h4>
+          <span id="metric-avg">-- kWh</span>
+        </div>
+        <div class="card stat">
+          <h4>Maximum Energy</h4>
+          <span id="metric-max">-- kWh</span>
+        </div>
+        <div class="card stat">
+          <h4>Model R²</h4>
+          <span id="metric-r2">--</span>
+        </div>
+        <div class="card stat">
+          <h4>Detected Anomalies</h4>
+          <span id="metric-anomalies">--</span>
+        </div>
+      </section>
+
+      <!-- Charts Section -->
+      <section class="charts-grid">
+        <div class="card chart-card">
+          <h3>Energy Consumption History</h3>
+          <canvas id="historyChart"></canvas>
+        </div>
+        <div class="card chart-card">
+          <h3>Actual vs Predicted Energy</h3>
+          <canvas id="actualVsPredChart"></canvas>
+        </div>
+        <div class="card chart-card">
+          <h3>Energy Usage Classification</h3>
+          <canvas id="usageChart"></canvas>
+        </div>
+        <div class="card chart-card">
+          <h3>Waste & Anomaly Distribution</h3>
+          <canvas id="distributionChart"></canvas>
+        </div>
+      </section>
+
+      <!-- Model Performance Table -->
+      <section class="card">
+        <h3>Model Performance Metrics</h3>
+        <table class="data-table">
+          <thead>
+            <tr><th>Metric</th><th>Value</th></tr>
+          </thead>
+          <tbody id="metrics-table-body">
+            <!-- Dynamic rows -->
+          </tbody>
+        </table>
+      </section>
+
+      <!-- Recommendations Table -->
+      <section class="card">
+        <h3>Smart Recommendations Samples</h3>
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Predicted</th>
+                <th>Anomaly</th>
+                <th>Waste</th>
+                <th>Level</th>
+                <th>Recommendation</th>
+              </tr>
+            </thead>
+            <tbody id="recommendations-table-body">
+              <!-- Dynamic rows -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
+4.  static/style.css  (Modern Styling)
+:root {
+  --bg-color: #0f172a;
+  --card-bg: #1e293b;
+  --sidebar-bg: #111827;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --accent: #38bdf8;
+  --accent-hover: #0284c7;
+  --border: #334155;
+  --badge-low: #22c55e;
+  --badge-warn: #f59e0b;
+  --badge-danger: #ef4444;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-main);
+}
+
+.layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 320px;
+  background: var(--sidebar-bg);
+  padding: 1.5rem;
